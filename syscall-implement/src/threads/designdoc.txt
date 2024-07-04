@@ -1,0 +1,168 @@
++------------------+
+| 	CS 521	   |
+| PINTOS PROJECT 1 |
+| DESIGN DOCUMENT  |
++------------------+
+
+---- GROUP ----
+Mehul Mittal <mehulmit@buffalo.edu>
+Safayat Bin Hakim <safayatb@buffalo.edu>
+Sreeja Manchikanti <sreejama@buffalo.edu>
+
+---- PRELIMINARIES ----
+
+None.
+
+	JOIN
+	====
+---- DATA STRUCTURES ----
+
+The `thread` structure was changed to accomodate information for
+- keeping track of how long a thread may sleep when timer_sleep has
+been called
+- holding it's original or "defined" priority
+- keeping track whether this thread has any locks, to understand whether 
+to rescind priority donation
+
+
+Added to struct thread:
+
+	struct thread {
+		...
+		int blocked_till; /* Used for sleep; will be blocked as long as `blocked_till` ticks is lower than global tick value */
+		int defined_priority; /* holds the priority the thread was set as, as priority variable may have a donated value */
+		bool has_locks; /* to keep track of whether the thread has any locks, to support priority donation */
+		int nice; /* Nice value used by MLFQS scheduler */
+		FP_t recent_cpu; /* Recent CPU used by MLFQS scheduler */
+		...
+	};
+
+The `lock` structure was changed to hold a list_elem, so that it may be
+kept in a list, `all_locks`, mentioned later in this section
+
+Added to struct lock:
+	struct lock {
+    		struct list_elem elem;      /* List element for keeping track of locks */
+  	};
+
+`static list all_locks`:
+It holds all locks that are held by any threads in PintOS, used for
+finding which locks some threads may have and then supporting 	
+priority donation based on it
+
+`static FP_t load_avg`:
+Stores the value of load_avg, used for MLFQS
+
+
+---- ALGORITHMS ----
+
+`timer_sleep()` sets thread->blocked_till value and calls thread_block(),
+ ensures to restore interrupts when it wakes up. 
+
+`unblock_if_overslept(struct thread *, void *)`:
+Called via `thread_foreach() pintos function, it iterates over all threads
+and if a thread is found to be blocked with a positive blocked_till value
+then it will check whether global_ticks is higher and if so, it will set the
+blocked_till timer to 0 and unblock the thread using thread_unblock()
+
+
+`pop_semaphore_with_priority_thread(struct list *)`:
+Called when a cond_signal is called, it goes through all the sempahores
+the condition has, and for each one, goes through its waiters to find the
+waiting thread with the highest priority, and returns that. 
+Since it is a double loop, it is a O(n*m) operation, n and m being sempahores
+waiting on the condition and m being the waiters on each sempahore.
+
+`get_priority_thread(struct list *)`:
+Returns the highest priority thread in the given list of threads
+
+`pop_priority_thread(struct list *)`:
+Same as `get_priority_thread`, but removes it from the list and 
+returns the thread pointer
+
+`lock_acquire(struct lock *)`:
+The `lock_acquire` method was modified to check if the thread 
+trying to acquire the lock or the thread waiting on the lock has
+a higher priority than the thread holding the lock and donating
+their priority if so. Also checks for nesting of locks for nesting
+of priority donation
+
+`check_bad_locks()`:
+It checks for any locks that may have been held by a dying thread
+If so, it removes it from `all_locks` list as the lock will never 
+be accessible further
+
+`lock_release(struct lock *)`:
+During lock release, we remove our lock from our `all_locks` list. We then call 
+`set_current_priority_from_held_locks` to see if our thread still holds any 
+locks and if it does, have it's own priority donated from their waiters
+
+`set_current_priority_from_held_locks(struct thread *)`:
+Goes through our `all_locks` list to see if the thread holds any locks
+and if it does, goes through all the waiters of the lock to find if it
+requires priority donation. If not, it will have set the thread back to
+the priority it originally had
+
+`reset_recent_cpu(struct thread *, void *)`:
+Recalculates the recent_cpu for the given thread, as per the BSD scheduler
+and clamps it between PRI_MAX and PRI_MIN
+
+`mlfqs_tick()`:
+Stores all the logic that needs to be calculated before the tick is complete
+Increments recent_cpu of current thread by 1 each time
+Calculates load_avg every second
+Calls `reset_recent_cpu` for every thread every second
+Calls `reset_priority` for every thread every 4 ticks
+
+
+`reset_priority(struct thread *, void *):
+Recalulates the priority of the given thread, as per the BSD scheduler
+
+
+---- SYNCHRONIZATION ----
+
+As the global ticks continues, our schedule() function is called regularly,
+by PintOS and inside this schedule() call, we check to unblock sleeping 
+threads before we decide on a new thread to be scheduled. 
+
+Whenever we check for sleeping threads, we ensure our `blocked_till` value 
+is not 0, to confirm it is blocked due to being asleep. If we  find that it
+has slept for  its intended duration, we set blocked_till to 0, to make 
+sure it's neither considered  a sleeping thread, nor will it be ever higher
+than global ticks. 
+
+Since this function call happens during `schedule()`, our interrupts are 
+turned off and therefore, we will not face synchronization issues regarding
+writing to blocked_till values in the thread structure.
+
+During `lock_acquire`, we calculate and set the threads priority by turning off interrupts
+as scheduling will by undefined during this step
+
+---- RATIONALE ----
+This design has the advantage of simplicity. Ensuring our thread scheduling
+checks and changes happening during the schedule() function call will make sure
+that our changes happen in an atomic fashion and no other threads may be reading
+or writing to their member variables while we our running our checks.
+
+Currently, we are checking for sleeping threads by iterating over all the threads.
+This can cause a huge overhead if the number of threads becomes large, just to
+implement a system to unblock possibly sleeping threads.
+
+We can instead maintain a blocked_list to reduce our iteration cost for every
+single invocation of schedule(). This will require extra management code and
+memory but will reduce our scheduling overheads.
+
+Our priority scheduler simply goes through all the ready threads and resumes the 
+thread with the highest priority. For semaphore sema_up and condition cond_signal, 
+the scheduler simply finds the threads that is waiting on these synchronization 
+handlers, and resumes that thread
+
+Our priority donation works in a simple manner as well, we keep track of all locks
+currently being held in PintOS and any threads which may be blocked by others threads
+holding the acquiree lock is simply handled by going through all locks and seeing if any 
+locks that are held by the thread have a higher priority waiter
+
+Our MLFQS scheduler does the scheduling in the timer interrupt handler to ensure no
+one else can work with the new tick before the MLFQS scheduling is completed.
+
+
